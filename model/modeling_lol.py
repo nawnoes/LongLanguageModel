@@ -26,14 +26,19 @@ import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
 
-from .configuration_xxx import XxxConfig
-from .file_utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_callable
-from .modeling_outputs import (
-    BaseModelOutputWithPooling,
-    MaskedLMOutput,
-    MultipleChoiceModelOutput,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutput,
-    TokenClassifierOutput,
+from model.configure_lol import LOLConfig
+
+from transformers.activations import gelu, gelu_fast, gelu_new, swish
+from transformers.configuration_reformer import ReformerConfig
+from transformers.file_utils import (
+    DUMMY_INPUTS,
+    DUMMY_MASK,
+    ModelOutput,
+    add_code_sample_docstrings,
+    add_start_docstrings,
+    add_start_docstrings_to_callable,
 )
-from .modeling_utils import PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutput, MaskedLMOutput, QuestionAnsweringModelOutput, SequenceClassifierOutput
+from transformers.modeling_utils import PreTrainedModel, apply_chunking_to_forward
+
+
