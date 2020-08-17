@@ -32,33 +32,16 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
+import numpy as np
 from torch.nn import CrossEntropyLoss, MSELoss
 from model.configure_lol import LOLConfig
 
+from transformers.file_utils import ModelOutput
 from transformers.activations import gelu, gelu_fast, gelu_new, swish, get_activation
 from transformers.configuration_electra import ElectraConfig
 from transformers.configuration_reformer import ReformerConfig
-from transformers.file_utils import (
-    ModelOutput,
-    DUMMY_INPUTS,
-    DUMMY_MASK,
-    ModelOutput,
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_callable,
-    replace_return_docstrings,
-
-)
-from transformers.modeling_outputs import (
-    BaseModelOutput,
-    CausalLMOutput,
-    MaskedLMOutput,
-    MultipleChoiceModelOutput,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutput,
-    TokenClassifierOutput,
-)
 from transformers.modeling_utils import PreTrainedModel, apply_chunking_to_forward
+from transformers.modeling_reformer import ReformerModel, ReformerEncoder
 from transformers.modeling_bert import BertEmbeddings, BertEncoder, BertLayerNorm, BertPreTrainedModel
 
 logger = logging.getLogger(__name__)
@@ -307,6 +290,25 @@ class LOLPreTrainedModel(BertPreTrainedModel):
     # load_tf_weights = load_tf_weights_in_electra
     base_model_prefix = "lol"
 
+    def _init_weights(self, module):
+        """ Initialize the weights """
+        if isinstance(module, AxialPositionEmbeddings):
+            for weight in module.weights:
+                torch.nn.init.normal_(weight, std=self.config.axial_norm_std)
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+        elif isinstance(module, nn.Linear):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+
+
 @dataclass
 class LOLForPreTrainingOutput(ModelOutput):
     """
@@ -335,19 +337,22 @@ class LOLForPreTrainingOutput(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
 
+"""
+ReformerModel과 동일한 구조
+"""
 class LOLModel(LOLPreTrainedModel):
-
     config_class = LOLConfig
 
     def __init__(self, config):
         super().__init__(config)
-        self.embeddings = LOLEmbeddings(config)
+        self.config = config
 
         if config.embedding_size != config.hidden_size:
             self.embeddings_project = nn.Linear(config.embedding_size, config.hidden_size)
 
-        self.encoder = BertEncoder(config)
-        self.config = config
+        self.embeddings = LOLEmbeddings(config)
+        self.encoder = ReformerEncoder(config)
+
         self.init_weights()
 
     def get_input_embeddings(self):
@@ -363,14 +368,6 @@ class LOLModel(LOLPreTrainedModel):
         """
         for layer, heads in heads_to_prune.items():
             self.encoder.layer[layer].attention.prune_heads(heads)
-
-    # @add_start_docstrings_to_callable(ELECTRA_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="google/electra-small-discriminator",
-        output_type=BaseModelOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
     def forward(
         self,
         input_ids=None,
@@ -379,10 +376,14 @@ class LOLModel(LOLPreTrainedModel):
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
+        num_hashes=None,
+        past_buckets_states=None,
+        use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
     ):
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -392,39 +393,154 @@ class LOLModel(LOLPreTrainedModel):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
-            input_shape = input_ids.size()
+            input_shape = input_ids.size()  # noqa: F841
+            device = input_ids.device
         elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
+            input_shape = inputs_embeds.size()[:-1]  # noqa: F841
+            device = inputs_embeds.device
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        assert (
+                len(input_shape) == 2
+        ), "`input_ids` have be of shape `[batch_size, sequence_length]`, but got shape: {}".format(input_shape)
 
-        if attention_mask is None:
-            attention_mask = torch.ones(input_shape, device=device)
-        if token_type_ids is None:
-            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+        if past_buckets_states is not None:
+            assert not self.training, "`past_buckets_states` can only be used for inference, not for training`."
 
-        extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape, device)
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+        # prepare head mask
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers, is_attention_chunked=True)
 
-        hidden_states = self.embeddings(
-            input_ids=input_ids, position_ids=position_ids, token_type_ids=token_type_ids, inputs_embeds=inputs_embeds
+        # original sequence length for padding
+        orig_sequence_length = input_shape[-1]
+
+        # if needs padding
+        least_common_mult_chunk_length = _get_least_common_mult_chunk_len(self.config)
+        min_chunk_length = _get_min_chunk_len(self.config)
+
+        must_pad_to_match_chunk_length = (
+                input_shape[-1] % least_common_mult_chunk_length != 0
+                and input_shape[-1] > min_chunk_length
+                and past_buckets_states is None
         )
 
-        if hasattr(self, "embeddings_project"):
-            hidden_states = self.embeddings_project(hidden_states)
+        if must_pad_to_match_chunk_length:
+            padding_length = least_common_mult_chunk_length - input_shape[-1] % least_common_mult_chunk_length
 
-        hidden_states = self.encoder(
-            hidden_states,
-            attention_mask=extended_attention_mask,
+            if self.training is True:
+                raise ValueError(
+                    "If training, sequence Length {} has to be a multiple of least common multiple chunk_length {}. Please consider padding the input to a length of {}.".format(
+                        input_shape[-1], least_common_mult_chunk_length, input_shape[-1] + padding_length
+                    )
+                )
+
+            # pad input
+            input_ids, inputs_embeds, attention_mask, position_ids, input_shape = self._pad_to_mult_of_chunk_length(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                input_shape=input_shape,
+                padding_length=padding_length,
+                padded_seq_length=least_common_mult_chunk_length,
+                device=device,
+            )
+
+        # start index for postion encoding depends on incremental decoding
+        if past_buckets_states is not None:
+            start_idx_pos_encodings = past_buckets_states[0][1].shape[1]
+        else:
+            start_idx_pos_encodings = 0
+
+        embedding_output = self.embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            start_idx_pos_encodings=start_idx_pos_encodings,
+        )
+
+        encoder_outputs = self.encoder(
+            hidden_states=embedding_output,
             head_mask=head_mask,
-            output_attentions=output_attentions,
+            attention_mask=attention_mask,
+            num_hashes=num_hashes,
+            past_buckets_states=past_buckets_states,
+            use_cache=use_cache,
+            orig_sequence_length=orig_sequence_length,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            output_attentions=output_attentions,
+        )
+        sequence_output = encoder_outputs.hidden_states
+
+        # if padding was applied
+        if must_pad_to_match_chunk_length:
+            sequence_output = sequence_output[:, :orig_sequence_length]
+
+        past_buckets_states = encoder_outputs.past_buckets_states if use_cache else None
+        hidden_states = encoder_outputs.all_hidden_states if output_hidden_states else None
+        attentions = encoder_outputs.all_attentions if output_attentions else None
+
+        if not return_dict:
+            return tuple(v for v in [sequence_output, past_buckets_states, hidden_states, attentions] if v is not None)
+        return LOLModelOutput(
+            last_hidden_state=sequence_output,
+            past_buckets_states=past_buckets_states,
+            hidden_states=hidden_states,
+            attentions=attentions,
         )
 
-        return hidden_states
+    def _pad_to_mult_of_chunk_length(
+            self,
+            input_ids,
+            inputs_embeds=None,
+            attention_mask=None,
+            position_ids=None,
+            input_shape=None,
+            padding_length=None,
+            padded_seq_length=None,
+            device=None,
+    ):
+        logger.info(
+            "Input ids are automatically padded from {} to {} to be a multiple of `config.chunk_length`: {}".format(
+                input_shape[-1], input_shape[-1] + padding_length, padded_seq_length
+            )
+        )
+
+        padded_input_ids = torch.full(
+            (input_shape[0], padding_length), self.config.pad_token_id, device=device, dtype=torch.long,
+        )
+
+        # Extend `attention_mask`
+        if attention_mask is not None:
+            pad_attention_mask = torch.zeros(input_shape[0], padding_length, device=device, dtype=attention_mask.dtype)
+
+            attention_mask = torch.cat([attention_mask, pad_attention_mask], dim=-1)
+        else:
+            attention_mask = torch.cat(
+                [
+                    torch.ones(input_shape, device=device, dtype=torch.uint8),
+                    torch.zeros((input_shape[0], padding_length), device=device, dtype=torch.uint8),
+                ],
+                dim=-1,
+            )
+
+        # Extend `input_ids` with padding to match least common multiple chunk_length
+        if input_ids is not None:
+            input_ids = torch.cat([input_ids, padded_input_ids], dim=-1)
+            input_shape = input_ids.size()
+
+            # Pad position ids if given
+            if position_ids is not None:
+                padded_position_ids = torch.arange(input_shape[-1], padded_seq_length, dtype=torch.long, device=device)
+                padded_position_ids = position_ids.unsqueeze(0).expand(input_shape[0], padding_length)
+                position_ids = torch.cat([position_ids, padded_position_ids], dim=-1)
+
+        # Extend `inputs_embeds` with padding to match least common multiple chunk_length
+        if inputs_embeds is not None:
+            padded_inputs_embeds = self.embeddings(padded_input_ids, position_ids)
+            inputs_embeds = torch.cat([inputs_embeds, padded_inputs_embeds], dim=-2)
+            input_shape = inputs_embeds.size()
+        return input_ids, inputs_embeds, attention_mask, position_ids, input_shape
 
 class LOLClassificationHead(nn.Module):
     """Head for sentence-level classification tasks."""
@@ -448,12 +564,10 @@ class LOLForPreTraining(LOLPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
-        self.electra = LOLModel(config)
+        self.lol = LOLModel(config)
         self.discriminator_predictions = LOLDiscriminatorPredictions(config)
         self.init_weights()
 
-    # @add_start_docstrings_to_callable(ELECTRA_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=LOLForPreTrainingOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids=None,
@@ -489,7 +603,7 @@ class LOLForPreTraining(LOLPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        discriminator_hidden_states = self.electra(
+        discriminator_hidden_states = self.lol(
             input_ids,
             attention_mask,
             token_type_ids,
@@ -526,3 +640,34 @@ class LOLForPreTraining(LOLPreTrainedModel):
             attentions=discriminator_hidden_states.attentions,
         )
 
+@dataclass
+class LOLModelOutput(ModelOutput):
+    """
+    Output type of :class:`~transformers.ReformerModel`.
+    Args:
+        last_hidden_state (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, num_predict, hidden_size)`):
+            Sequence of hidden-states at the last layer of the model.
+            ``num_predict`` corresponds to ``target_mapping.shape[1]``. If ``target_mapping`` is ``None``, then
+            ``num_predict`` corresponds to ``sequence_length``.
+        past_buckets_states (:obj:`List[Tuple(torch.LongTensor, torch.FloatTensor)]`, `optional`, returned when ``use_cache=True`` is passed or when ``config.use_cache=True``):
+            List of :obj:`tuple(torch.LongTensor, torch.FloatTensor` of length :obj:`config.n_layers`,  with :obj:`tuple(0)` being the previous `buckets` of shape
+            :obj:`(batch_size, num_heads, num_hashes, sequence_length)`)
+            and :obj:`tuple(1)` being the previous `hidden_states` of shape
+            :obj:`(batch_size, sequence_length, hidden_size)`).
+            Contains pre-computed buckets and hidden-states that can be used (see
+            ``past_buckets_states`` input) to speed up sequential decoding.
+        hidden_states (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_hidden_states=True`` is passed or when ``config.output_hidden_states=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer)
+            of shape :obj:`(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        attentions (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_attentions=True`` is passed or when ``config.output_attentions=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for each layer) of shape
+            :obj:`(batch_size, num_heads, sequence_length, sequence_length)`.
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    last_hidden_state: torch.FloatTensor
+    past_buckets_states: Optional[List[Tuple[torch.LongTensor, torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
